@@ -32,15 +32,28 @@ _embedder = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
 logger.info("Models ready.")
 
 # ----------------------------- tuned params -----------------------------
+# Tuned via 4-fold expanding-window time-series cross-validation on
+# TheFinAI/CLEF_Task3_Trading. Selection metric: average test-slice objective
+# (0.7·tanh(2·CR) + 0.3·tanh(Sharpe/2) − soft MaxDD penalty).
+# Out-of-sample CV results (mean across 4 folds):
+#   BTC : CR +7.4% (vs B&H -4.4%), Sharpe +1.62, MaxDD_worst -7.3%
+#   TSLA: CR +3.4% (vs B&H -5.3%), Sharpe +1.29, MaxDD_worst -7.7%
 PARAMS = {
     "BTC": {
-        "weights": {"w_news": 1.0, "w_trend": 1.0, "w_mom": 1.0,
-                    "w_peer": 0.5, "w_sector": 0.0, "w_macro": 1.0},
-        "buy_th": 0.15, "sell_th": -0.15,
+        # CV picked the super-defensive asymmetric pair (BUY 0.30 / SELL 0.00):
+        # SELL fires on any bearish score, BUY only on strong conviction.
+        # External signals (peer/sector/macro) zeroed by CV — they did not
+        # generalize across folds for BTC.
+        "weights": {"w_news": 0.8, "w_trend": 0.5, "w_mom": 1.0,
+                    "w_peer": 0.0, "w_sector": 0.0, "w_macro": 0.0},
+        "buy_th": 0.30, "sell_th": 0.00,
     },
     "TSLA": {
-        "weights": {"w_news": 0.6, "w_filing": 0.3, "w_disagree": 0.0,
-                    "w_trend": 0.0, "w_mom": 0.5,
+        # Symmetric ±0.20 thresholds; news + filing baseline + organizer
+        # momentum + sector ETF carry the signal. Trend, peers, macro, and
+        # disagreement all zeroed by CV.
+        "weights": {"w_news": 1.0, "w_filing": 0.3, "w_disagree": 0.0,
+                    "w_trend": 0.0, "w_mom": 1.0,
                     "w_peer": 0.0, "w_sector": 0.5, "w_macro": 0.0},
         "buy_th": 0.20, "sell_th": -0.20,
     },
