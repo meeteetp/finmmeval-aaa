@@ -1,7 +1,9 @@
 import hashlib
+import json
 import logging
 import time
 from datetime import timedelta
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -31,13 +33,30 @@ logger.info("Loading MiniLM...")
 _embedder = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
 logger.info("Models ready.")
 
+# ----------------------------- EDGAR filings cache -----------------------------
+# Static JSON file keyed by filing date. Sections (Risk Factors / MD&A /
+# Forward-Looking Statements) extracted by the backtest notebook (which fetches
+# from SEC EDGAR via sec-edgar-downloader) and committed to the repo.
+# Forward-fill semantics: each request uses the most recent filing on or
+# before payload['date'], so live behavior mirrors as-of-date backtest logic.
+EDGAR_FILINGS: dict = {}
+EDGAR_DATES: list = []
+_filings_path = Path(__file__).parent / "filings_tsla.json"
+if _filings_path.exists():
+    EDGAR_FILINGS = json.loads(_filings_path.read_text())
+    EDGAR_DATES = sorted(EDGAR_FILINGS.keys())
+    logger.info("Loaded %d EDGAR filings from %s", len(EDGAR_FILINGS), _filings_path.name)
+else:
+    logger.warning("filings_tsla.json not found — TSLA path will use only the organizer-provided summary")
+
 # ----------------------------- tuned params -----------------------------
 # Tuned via 4-fold expanding-window time-series cross-validation on
-# TheFinAI/CLEF_Task3_Trading. Selection metric: average test-slice objective
-# (0.7·tanh(2·CR) + 0.3·tanh(Sharpe/2) − soft MaxDD penalty).
+# TheFinAI/CLEF_Task3_Trading + SEC EDGAR filing sections (Risk Factors / MD&A /
+# Forward-Looking) forward-filled by date. Selection metric: average test-slice
+# objective (0.7·tanh(2·CR) + 0.3·tanh(Sharpe/2) − soft MaxDD penalty).
 # Out-of-sample CV results (mean across 4 folds):
-#   BTC : CR +7.4% (vs B&H -4.4%), Sharpe +1.62, MaxDD_worst -7.3%
-#   TSLA: CR +3.4% (vs B&H -5.3%), Sharpe +1.29, MaxDD_worst -7.7%
+#   BTC : CR +7.4% (vs B&H -4.8%), Sharpe +1.62, MaxDD_worst -7.3%
+#   TSLA: CR +6.1% (vs B&H -5.4%), Sharpe +2.22, MaxDD_worst -5.0%
 PARAMS = {
     "BTC": {
         # CV picked the super-defensive asymmetric pair (BUY 0.30 / SELL 0.00):
@@ -49,13 +68,13 @@ PARAMS = {
         "buy_th": 0.30, "sell_th": 0.00,
     },
     "TSLA": {
-        # Symmetric ±0.20 thresholds; news + filing baseline + organizer
-        # momentum + sector ETF carry the signal. Trend, peers, macro, and
-        # disagreement all zeroed by CV.
-        "weights": {"w_news": 1.0, "w_filing": 0.3, "w_disagree": 0.0,
-                    "w_trend": 0.0, "w_mom": 1.0,
-                    "w_peer": 0.0, "w_sector": 0.5, "w_macro": 0.0},
-        "buy_th": 0.20, "sell_th": -0.20,
+        # Tighter symmetric ±0.12 thresholds. EDGAR-augmented filing tone
+        # (w_filing 0.6) and peer returns (w_peer 1.0) carry significant signal
+        # alongside news. Sector, macro, trend, disagreement zeroed by CV.
+        "weights": {"w_news": 0.6, "w_filing": 0.6, "w_disagree": 0.0,
+                    "w_trend": 0.0, "w_mom": 0.5,
+                    "w_peer": 1.0, "w_sector": 0.0, "w_macro": 0.0},
+        "buy_th": 0.12, "sell_th": -0.12,
     },
 }
 
@@ -188,6 +207,16 @@ def _macro_signal(asof_str: str) -> float:
     return float(np.clip(raw, -0.10, 0.10))
 
 
+def _asof_edgar_filing(asof_str: str):
+    """Most recent EDGAR filing filed on or before asof_str. None if none yet."""
+    if not asof_str or not EDGAR_DATES:
+        return None
+    relevant = [d for d in EDGAR_DATES if d <= asof_str]
+    if not relevant:
+        return None
+    return EDGAR_FILINGS[relevant[-1]]
+
+
 # ----------------------------- decision logic -----------------------------
 def _predict(payload: dict) -> str:
     symbols = payload.get("symbol") or []
@@ -207,12 +236,20 @@ def _predict(payload: dict) -> str:
     disagreement = 0.0
     if symbol == "TSLA":
         filings = []
+        # 1) Organizer-provided executive summary (sparse — only on filing dates)
         for key in ("10k", "10q"):
             v = payload.get(key)
             if isinstance(v, dict):
                 filings.extend([str(x) for x in (v.get(symbol) or []) if x])
             elif isinstance(v, list):
                 filings.extend([str(x) for x in v if x])
+        # 2) EDGAR sections, forward-filled by date (always available once filed)
+        edgar = _asof_edgar_filing(asof)
+        if edgar:
+            for section in ("risk_factors", "mdna", "forward_looking"):
+                txt = edgar.get(section)
+                if txt and len(txt) > 100:
+                    filings.append(f"[{section.upper()}] {txt}")
         sig = _filing_signals(filings)
         if sig and news_list:
             news_emb = _embed(news_list[:10])

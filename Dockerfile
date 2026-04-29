@@ -15,6 +15,7 @@ AutoModelForSequenceClassification.from_pretrained('ProsusAI/finbert'); \
 from sentence_transformers import SentenceTransformer; \
 SentenceTransformer('sentence-transformers/all-MiniLM-L6-v2')"
 
+COPY filings_tsla.json ./
 COPY app.py .
 
 EXPOSE 8080
